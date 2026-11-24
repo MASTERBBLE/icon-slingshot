@@ -59,6 +59,22 @@ namespace IconSlingshot
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(PT p);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int max);
         public delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+
+        public static System.Collections.Generic.List<IntPtr> VisibleWindows()
+        {
+            var list = new System.Collections.Generic.List<IntPtr>();
+            EnumWindows((h, l) => { if (IsWindowVisible(h) && !IsIconic(h)) list.Add(h); return true; }, IntPtr.Zero);
+            return list;
+        }
+        public static void RestoreWindows(System.Collections.Generic.List<IntPtr> hs)
+        {
+            foreach (var h in hs) { try { ShowWindow(h, 9); } catch { } }
+        }
         [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookExW(int idHook, HookProc proc, IntPtr hMod, uint threadId);
         [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr h);
         [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr h, int code, IntPtr w, IntPtr l);
@@ -368,7 +384,7 @@ namespace IconSlingshot
         bool modeListOn;
         RectangleF btnMode, lstNormal, lstFull;
 
-        // 云端榜（WorkBuddy 云服务；endpoint/key 为公开标识，允许进源码）
+        // 云端榜（WorkBuddy 云服务；endpoint/key 随单文件公开，任何人都能读取/提交，勿放敏感数据）
         const string CloudEp = "https://wbapp-fly2w17y7s23cwjzpgtv86.app.workbuddy.host";
         const string CloudKey = "wbpk_FLY2w17Y7S23cwJZPgTV86_2ogOXimC822J4ShkRSRzNLLOhAwryRpO";
         long attackStartMs;   // 本局开始时间（算用时→得分率）
@@ -1807,6 +1823,31 @@ if (Test-Path $copyManifest) {
 [void][IconSlingshot.Native]::SetProcessDPIAware()
 $icons = [IconSlingshot.Native]::GetIcons()
 Write-Log ("图标数: " + $icons.Count)
+
+# 上次异常退出残留：先按旧快照复位，再删残留副本（避免图标留在被打乱的位置）
+if (Test-Path $snapPath) {
+  try {
+    $old = @(Get-Content $snapPath -Encoding UTF8 | Where-Object { $_ -match '\|' })
+    $restoredOld = 0
+    foreach ($line in $old) {
+      $parts = $line -split '\|', 3
+      if ($parts.Count -eq 3) {
+        try { if ([IconSlingshot.Native]::MoveIcon($parts[0], [int]$parts[1], [int]$parts[2])) { $restoredOld++ } } catch { }
+      }
+    }
+    Write-Log ("上次残留快照复位: $restoredOld/" + $old.Count)
+  } catch { Write-Log ('残留快照复位失败: ' + $_.Exception.Message) }
+  Remove-Item $snapPath -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path $copyManifest) {
+  try {
+    Get-Content $copyManifest -Encoding UTF8 | ForEach-Object {
+      if ($_ -and (Test-Path -LiteralPath $_)) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item $copyManifest -Force -ErrorAction SilentlyContinue
+    Write-Log '已清理上次残留的弹药副本'
+  } catch { Write-Log ('残留副本清理失败: ' + $_.Exception.Message) }
+}
 if ($icons.Count -eq 0) {
   [System.Windows.Forms.MessageBox]::Show('没找到桌面图标（或被系统策略拦截），游戏无法开始。', '图标弹弓', 'OK', 'Warning') | Out-Null
   exit 1
@@ -1841,6 +1882,7 @@ Write-Log ("可复制图标: " + @($paths.Values | Where-Object { $_ -notlike ':
 Set-Content -Path $snapPath -Encoding UTF8 -Value ($icons | ForEach-Object { "{0}|{1}|{2}" -f $_.Name, $_.X, $_.Y })
 
 # ---------------- 最小化所有窗口：只留壁纸和真图标 ----------------
+$windowsBefore = [IconSlingshot.Native]::VisibleWindows()
 try {
   $shell = New-Object -ComObject Shell.Application
   $shell.MinimizeAll()
@@ -1861,22 +1903,32 @@ try {
   Write-Log '游戏窗口启动'
   [void]$form.ShowDialog()
   Write-Log '游戏结束'
-  # 复位：全部图标按快照搬回原位
-  $restored = 0
-  foreach ($ic in $icons) {
-    if ([IconSlingshot.Native]::MoveIcon($ic.Name, $ic.X, $ic.Y)) { $restored++ }
+} finally {
+  # 复位：全部图标按快照搬回原位（异常退出也会执行）
+  $restoreOk = $false
+  try {
+    $restored = 0
+    foreach ($ic in $icons) {
+      if ([IconSlingshot.Native]::MoveIcon($ic.Name, $ic.X, $ic.Y)) { $restored++ }
+    }
+    Write-Log ("复位完成: $restored/" + $icons.Count)
+    $restoreOk = ($restored -eq $icons.Count)
+  } catch {
+    Write-Log ('复位失败: ' + $_.Exception.Message)
   }
-  Write-Log ("复位完成: $restored/" + $icons.Count)
   # 删除复制出来的弹药副本
   if (Test-Path $copyManifest) {
-    $deleted = 0
-    Get-Content $copyManifest -Encoding UTF8 | ForEach-Object {
-      if ($_ -and (Test-Path -LiteralPath $_)) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue; $deleted++ }
-    }
-    Remove-Item $copyManifest -Force -ErrorAction SilentlyContinue
-    Write-Log ("弹药副本清理: $deleted")
+    try {
+      $deleted = 0
+      Get-Content $copyManifest -Encoding UTF8 | ForEach-Object {
+        if ($_ -and (Test-Path -LiteralPath $_)) { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue; $deleted++ }
+      }
+      Remove-Item $copyManifest -Force -ErrorAction SilentlyContinue
+      Write-Log ("弹药副本清理: $deleted")
+    } catch { Write-Log ('弹药副本清理失败: ' + $_.Exception.Message) }
   }
-} finally {
+  # 恢复游戏开始前可见的窗口
+  try { [IconSlingshot.Native]::RestoreWindows($windowsBefore) } catch { Write-Log ('窗口恢复失败: ' + $_.Exception.Message) }
   Remove-Item $snapPath -Force -ErrorAction SilentlyContinue
-  Write-Log '===== 退出，桌面已复位 ====='
+  Write-Log ("===== 退出，桌面复位" + $(if ($restoreOk) { "成功" } else { "可能不完整" }) + " =====")
 }
